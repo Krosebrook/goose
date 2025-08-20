@@ -47,55 +47,49 @@ export const ContextManagerProvider: React.FC<{ children: React.ReactNode }> = (
       setCompactionError(null);
 
       try {
-        // Get the summary from the backend without showing any marker during compaction
+        // Get the summary from the backend
         const summaryResponse = await manageContextFromBackend({
           messages: messages,
           manageAction: 'summarize',
         });
 
         // Convert API messages to frontend messages
-        const convertedMessages = summaryResponse.messages.map(
-          (apiMessage) => convertApiMessageToFrontendMessage(apiMessage, false, true) // don't show to user but send to llm
-        );
+        const convertedMessages = summaryResponse.messages.map((apiMessage, index) => {
+          // The server now provides the compaction marker and summary messages
+          // First message should be the compaction marker (display: true, sendToLLM: false)
+          // Second message should be the summary (display: false, sendToLLM: true)
+          // Third message should be the continuation message (display: false, sendToLLM: true)
+          if (index === 0) {
+            // Compaction marker - show to user but don't send to LLM
+            return convertApiMessageToFrontendMessage(apiMessage, true, false);
+          } else if (index === 1) {
+            // Summary message - don't show to user but send to LLM
+            return convertApiMessageToFrontendMessage(apiMessage, false, true);
+          } else {
+            // Continuation message - don't show to user but send to LLM
+            return convertApiMessageToFrontendMessage(apiMessage, false, true);
+          }
+        });
 
-        // Extract summary from the first message
-        const summaryMessage = convertedMessages[0];
-        if (
-          summaryMessage &&
-          summaryMessage.content[0] &&
-          summaryMessage.content[0].type === 'text'
-        ) {
-          // Create a compaction marker to show where compaction occurred
-          const compactionMarker: Message = {
-            id: `compaction-marker-${Date.now()}`,
-            role: 'assistant',
-            created: Math.floor(Date.now() / 1000),
-            content: [
-              {
-                type: 'summarizationRequested',
-                msg: 'Conversation compacted and summarized',
-              },
-            ],
+        // Store the original messages as ancestor messages so they can still be scrolled to
+        if (setAncestorMessages) {
+          const ancestorMessages = messages.map((msg) => ({
+            ...msg,
             display: true,
             sendToLLM: false,
-          };
+          }));
+          setAncestorMessages(ancestorMessages);
+        }
 
-          // Store the original messages as ancestor messages so they can still be scrolled to
-          if (setAncestorMessages) {
-            const ancestorMessages = messages.map((msg) => ({
-              ...msg,
-              display: true,
-              sendToLLM: false,
-            }));
-            setAncestorMessages(ancestorMessages);
-          }
+        // Replace messages with the server-provided messages
+        setMessages(convertedMessages);
 
-          // Replace messages with the marker and summary
-          setMessages([compactionMarker, summaryMessage]);
-
-          // Automatically submit the summary message to continue the conversation
+        // Automatically submit the continuation message to continue the conversation
+        // This should be the third message (index 2) which contains the "I ran into a context length exceeded error..." text
+        const continuationMessage = convertedMessages[2];
+        if (continuationMessage) {
           setTimeout(() => {
-            append(summaryMessage);
+            append(continuationMessage);
           }, 100);
         }
 
@@ -104,7 +98,7 @@ export const ContextManagerProvider: React.FC<{ children: React.ReactNode }> = (
         console.error('Error during compaction:', err);
         setCompactionError(err instanceof Error ? err.message : 'Unknown error during compaction');
 
-        // Update the marker to show error
+        // Create an error marker
         const errorMarker: Message = {
           id: `compaction-error-${Date.now()}`,
           role: 'assistant',

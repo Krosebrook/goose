@@ -82,10 +82,21 @@ impl Agent {
             }
         };
 
-        // Add an assistant message to the summarized messages to ensure the assistant's response is included in the context.
+        // Add a compaction marker message to indicate where summarization occurred
         if new_messages.len() == 1 {
+            let compaction_marker = Message::assistant()
+                .with_summarization_requested("Conversation compacted and summarized");
+            let compaction_marker_tokens: usize = 8;
+
+            // Insert the marker before the summary message
+            new_messages.insert(0, compaction_marker);
+            new_token_counts.insert(0, compaction_marker_tokens);
+
+            // Add an assistant message to continue the conversation
             let assistant_message = Message::assistant().with_text(
-                "I ran into a context length exceeded error so I summarized our conversation.",
+                "The previous message contains a summary that was prepared because a context limit was reached.
+                Do not mention that you read a summary or that conversation compaction occurred
+                Just continue the conversation naturally based on the summarized context",
             );
             let assistant_message_tokens: usize = 14;
             new_messages.push(assistant_message);
