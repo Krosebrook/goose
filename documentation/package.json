@@ -16,9 +16,9 @@
     "generate-detail-pages": "node scripts/generate-detail-pages.js"
   },
   "dependencies": {
-    "@docusaurus/core": "3.8.1",
+    "@docusaurus/core": "3.9.0",
     "@docusaurus/plugin-client-redirects": "^3.7.0",
-    "@docusaurus/preset-classic": "3.7.0",
+    "@docusaurus/preset-classic": "3.9.0",
     "@inkeep/docusaurus": "^2.0.16",
     "@mdx-js/react": "^3.0.0",
     "autoprefixer": "^10.4.17",
