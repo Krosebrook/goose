@@ -1,59 +1,42 @@
 import { useEffect, useState } from 'react';
 import { Card, CardContent, CardDescription } from '../ui/card';
-import { getApiUrl } from '../../config';
 import { Greeting } from '../common/Greeting';
-import { fetchSessions, fetchSessionDetails, type Session } from '../../sessions';
 import { useNavigate } from 'react-router-dom';
 import { Button } from '../ui/button';
 import { ChatSmart } from '../icons/';
 import { Goose } from '../icons/Goose';
 import { Skeleton } from '../ui/skeleton';
-
-interface SessionInsightsType {
-  totalSessions: number;
-  mostActiveDirs: [string, number][];
-  avgSessionDuration: number;
-  totalTokens: number;
-}
+import {
+  getSessionInsights,
+  listSessions,
+  Session,
+  SessionInsights as ApiSessionInsights,
+} from '../../api';
+import { resumeSession } from '../../sessions';
+import { useNavigation } from '../../hooks/useNavigation';
 
 export function SessionInsights() {
-  const [insights, setInsights] = useState<SessionInsightsType | null>(null);
+  const [insights, setInsights] = useState<ApiSessionInsights | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [recentSessions, setRecentSessions] = useState<Session[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [isLoadingSessions, setIsLoadingSessions] = useState(true);
   const navigate = useNavigate();
+  const setView = useNavigation();
 
   useEffect(() => {
     let loadingTimeout: ReturnType<typeof setTimeout>;
 
     const loadInsights = async () => {
       try {
-        const response = await fetch(getApiUrl('/sessions/insights'), {
-          headers: {
-            Accept: 'application/json',
-            'Content-Type': 'application/json',
-            'X-Secret-Key': await window.electron.getSecretKey(),
-          },
-        });
-
-        if (!response.ok) {
-          const errorText = await response.text();
-          throw new Error(`Failed to fetch insights: ${response.status} ${errorText}`);
-        }
-
-        const data = await response.json();
-        setInsights(data);
-        // Clear any previous error when insights load successfully
+        const response = await getSessionInsights({ throwOnError: true });
+        setInsights(response.data);
         setError(null);
       } catch (error) {
         console.error('Failed to load insights:', error);
         setError(error instanceof Error ? error.message : 'Failed to load insights');
-        // Set fallback insights data so the UI can still render
         setInsights({
           totalSessions: 0,
-          mostActiveDirs: [],
-          avgSessionDuration: 0,
           totalTokens: 0,
         });
       } finally {
@@ -63,10 +46,8 @@ export function SessionInsights() {
 
     const loadRecentSessions = async () => {
       try {
-        const sessions = await fetchSessions();
-        setRecentSessions(sessions.slice(0, 3));
-      } catch (error) {
-        console.error('Failed to load recent sessions:', error);
+        const response = await listSessions<true>({ throwOnError: true });
+        setRecentSessions(response.data.sessions.slice(0, 3));
       } finally {
         setIsLoadingSessions(false);
       }
@@ -85,6 +66,7 @@ export function SessionInsights() {
             mostActiveDirs: [],
             avgSessionDuration: 0,
             totalTokens: 0,
+            recentActivity: [],
           };
         }
         // If we already have insights, just make sure loading is false
@@ -104,21 +86,13 @@ export function SessionInsights() {
     };
   }, []);
 
-  const handleSessionClick = async (sessionId: string) => {
+  const handleSessionClick = async (session: Session) => {
     try {
-      // Fetch the session details
-      const sessionDetails = await fetchSessionDetails(sessionId);
-
-      // Navigate to pair view with the resumed session
-      navigate('/pair', {
-        state: { resumedSession: sessionDetails },
-        replace: true,
-      });
+      resumeSession(session, setView);
     } catch (error) {
-      console.error('Failed to load session:', error);
-      // Fallback to the sessions view if loading fails
+      console.error('Failed to start session:', error);
       navigate('/sessions', {
-        state: { selectedSessionId: sessionId },
+        state: { selectedSessionId: session.id },
         replace: true,
       });
     }
@@ -162,16 +136,6 @@ export function SessionInsights() {
               </div>
             </CardContent>
           </Card>
-
-          {/* Average Duration Card Skeleton */}
-          {/*<Card className="w-full py-6 px-6 border-none rounded-2xl bg-background-default">*/}
-          {/*  <CardContent className="flex flex-col justify-end h-full p-0">*/}
-          {/*    <div className="flex flex-col justify-end">*/}
-          {/*      <Skeleton className="h-10 w-20 mb-1" />*/}
-          {/*      <span className="text-xs text-text-muted">Avg. chat length</span>*/}
-          {/*    </div>*/}
-          {/*  </CardContent>*/}
-          {/*</Card>*/}
 
           {/* Total Tokens Card Skeleton */}
           <Card className="w-full py-6 px-6 border-none rounded-2xl bg-background-default">
@@ -358,24 +322,22 @@ export function SessionInsights() {
                     <div
                       key={session.id}
                       className="flex items-center justify-between text-sm py-1 px-2 rounded-md hover:bg-background-muted cursor-pointer transition-colors session-item"
-                      onClick={() => handleSessionClick(session.id)}
+                      onClick={() => handleSessionClick(session)}
                       role="button"
                       tabIndex={0}
                       style={{ animationDelay: `${index * 0.1}s` }}
                       onKeyDown={async (e) => {
                         if (e.key === 'Enter' || e.key === ' ') {
-                          await handleSessionClick(session.id);
+                          await handleSessionClick(session);
                         }
                       }}
                     >
                       <div className="flex items-center space-x-2">
                         <ChatSmart className="h-4 w-4 text-text-muted" />
-                        <span className="truncate max-w-[300px]">
-                          {session.metadata.description || session.id}
-                        </span>
+                        <span className="truncate max-w-[300px]">{session.name}</span>
                       </div>
                       <span className="text-text-muted font-mono font-light">
-                        {formatDateOnly(session.modified)}
+                        {formatDateOnly(session.updated_at)}
                       </span>
                     </div>
                   ))

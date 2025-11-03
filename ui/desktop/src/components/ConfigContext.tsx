@@ -8,6 +8,7 @@ import {
   addExtension as apiAddExtension,
   removeExtension as apiRemoveExtension,
   providers,
+  getProviderModels as apiGetProviderModels,
 } from '../api';
 import type {
   ConfigResponse,
@@ -18,7 +19,6 @@ import type {
   ExtensionQuery,
   ExtensionConfig,
 } from '../api';
-import { removeShims } from './settings/extensions/utils';
 
 export type { ExtensionConfig } from '../api/types.gen';
 
@@ -39,6 +39,7 @@ interface ConfigContextType {
   removeExtension: (name: string) => Promise<void>;
   getProviders: (b: boolean) => Promise<ProviderDetails[]>;
   getExtensions: (b: boolean) => Promise<FixedExtensionEntry[]>;
+  getProviderModels: (providerName: string) => Promise<string[]>;
   disableAllExtensions: () => Promise<void>;
   enableBotExtensions: (extensions: ExtensionConfig[]) => Promise<void>;
 }
@@ -120,10 +121,6 @@ export const ConfigProvider: React.FC<ConfigProviderProps> = ({ children }) => {
 
   const addExtension = useCallback(
     async (name: string, config: ExtensionConfig, enabled: boolean) => {
-      // remove shims if present
-      if (config.type === 'stdio') {
-        config.cmd = removeShims(config.cmd);
-      }
       const query: ExtensionQuery = { name, config, enabled };
       await apiAddExtension({
         body: query,
@@ -185,6 +182,21 @@ export const ConfigProvider: React.FC<ConfigProviderProps> = ({ children }) => {
     [providersList]
   );
 
+  const getProviderModels = useCallback(async (providerName: string): Promise<string[]> => {
+    try {
+      const response = await apiGetProviderModels({
+        path: { name: providerName },
+        headers: {
+          'X-Secret-Key': await window.electron.getSecretKey(),
+        },
+      });
+      return response.data || [];
+    } catch (error) {
+      console.error(`Failed to fetch models for provider ${providerName}:`, error);
+      return [];
+    }
+  }, []);
+
   useEffect(() => {
     // Load all configuration data and providers on mount
     (async () => {
@@ -242,6 +254,7 @@ export const ConfigProvider: React.FC<ConfigProviderProps> = ({ children }) => {
       toggleExtension,
       getProviders,
       getExtensions,
+      getProviderModels,
       disableAllExtensions,
       enableBotExtensions,
     };
@@ -257,6 +270,7 @@ export const ConfigProvider: React.FC<ConfigProviderProps> = ({ children }) => {
     toggleExtension,
     getProviders,
     getExtensions,
+    getProviderModels,
     reloadConfig,
   ]);
 

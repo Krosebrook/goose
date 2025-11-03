@@ -1,10 +1,9 @@
-import { useRef, useMemo, useState, useEffect, useCallback } from 'react';
-import LinkPreview from './LinkPreview';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import ImagePreview from './ImagePreview';
-import { extractUrls } from '../utils/urlUtils';
 import { extractImagePaths, removeImagePathsFromText } from '../utils/imageUtils';
 import MarkdownContent from './MarkdownContent';
-import { Message, getTextContent } from '../types/message';
+import { getTextContent } from '../types/message';
+import { Message } from '../api';
 import MessageCopyLink from './MessageCopyLink';
 import { formatMessageTimestamp } from '../utils/timeUtils';
 import Edit from './icons/Edit';
@@ -38,16 +37,8 @@ export default function UserMessage({ message, onMessageUpdate }: UserMessagePro
   // Memoize the timestamp
   const timestamp = useMemo(() => formatMessageTimestamp(message.created), [message.created]);
 
-  // Extract URLs which explicitly contain the http:// or https:// protocol
-  const urls = useMemo(() => extractUrls(displayText, []), [displayText]);
-
   // Effect to handle message content changes and ensure persistence
   useEffect(() => {
-    // Log content display for debugging
-    window.electron.logInfo(
-      `Displaying content for message: ${message.id} content: ${displayText}`
-    );
-
     // If we're not editing, update the edit content to match the current message
     if (!isEditing) {
       setEditContent(displayText);
@@ -251,16 +242,6 @@ export default function UserMessage({ message, onMessageUpdate }: UserMessagePro
         {hasBeenEdited && !isEditing && (
           <div className="text-xs text-text-subtle mt-1 text-right transition-opacity duration-200">
             Edited
-          </div>
-        )}
-
-        {/* TODO(alexhancock): Re-enable link previews once styled well again */}
-        {/* eslint-disable-next-line no-constant-binary-expression */}
-        {false && urls.length > 0 && (
-          <div className="flex flex-wrap mt-2">
-            {urls.map((url, index) => (
-              <LinkPreview key={index} url={url} />
-            ))}
           </div>
         )}
       </div>

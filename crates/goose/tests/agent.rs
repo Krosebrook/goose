@@ -1,10 +1,9 @@
-// src/lib.rs or tests/truncate_agent_tests.rs
-
 use std::sync::Arc;
 
 use anyhow::Result;
 use futures::StreamExt;
 use goose::agents::{Agent, AgentEvent};
+use goose::config::extensions::{set_extension, ExtensionEntry};
 use goose::conversation::message::Message;
 use goose::conversation::Conversation;
 use goose::model::ModelConfig;
@@ -12,20 +11,20 @@ use goose::providers::base::Provider;
 use goose::providers::{
     anthropic::AnthropicProvider, azure::AzureProvider, bedrock::BedrockProvider,
     databricks::DatabricksProvider, gcpvertexai::GcpVertexAIProvider, google::GoogleProvider,
-    groq::GroqProvider, ollama::OllamaProvider, openai::OpenAiProvider,
-    openrouter::OpenRouterProvider, xai::XaiProvider,
+    ollama::OllamaProvider, openai::OpenAiProvider, openrouter::OpenRouterProvider,
+    xai::XaiProvider,
 };
 
 #[derive(Debug, PartialEq)]
 enum ProviderType {
     Azure,
     OpenAi,
+    #[allow(dead_code)]
     Anthropic,
     Bedrock,
     Databricks,
     GcpVertexAI,
     Google,
-    Groq,
     Ollama,
     OpenRouter,
     Xai,
@@ -44,7 +43,6 @@ impl ProviderType {
             ProviderType::Bedrock => &["AWS_PROFILE"],
             ProviderType::Databricks => &["DATABRICKS_HOST"],
             ProviderType::Google => &["GOOGLE_API_KEY"],
-            ProviderType::Groq => &["GROQ_API_KEY"],
             ProviderType::Ollama => &[],
             ProviderType::OpenRouter => &["OPENROUTER_API_KEY"],
             ProviderType::GcpVertexAI => &["GCP_PROJECT_ID", "GCP_LOCATION"],
@@ -70,19 +68,20 @@ impl ProviderType {
         }
     }
 
-    fn create_provider(&self, model_config: ModelConfig) -> Result<Arc<dyn Provider>> {
+    async fn create_provider(&self, model_config: ModelConfig) -> Result<Arc<dyn Provider>> {
         Ok(match self {
-            ProviderType::Azure => Arc::new(AzureProvider::from_env(model_config)?),
-            ProviderType::OpenAi => Arc::new(OpenAiProvider::from_env(model_config)?),
-            ProviderType::Anthropic => Arc::new(AnthropicProvider::from_env(model_config)?),
-            ProviderType::Bedrock => Arc::new(BedrockProvider::from_env(model_config)?),
-            ProviderType::Databricks => Arc::new(DatabricksProvider::from_env(model_config)?),
-            ProviderType::GcpVertexAI => Arc::new(GcpVertexAIProvider::from_env(model_config)?),
-            ProviderType::Google => Arc::new(GoogleProvider::from_env(model_config)?),
-            ProviderType::Groq => Arc::new(GroqProvider::from_env(model_config)?),
-            ProviderType::Ollama => Arc::new(OllamaProvider::from_env(model_config)?),
-            ProviderType::OpenRouter => Arc::new(OpenRouterProvider::from_env(model_config)?),
-            ProviderType::Xai => Arc::new(XaiProvider::from_env(model_config)?),
+            ProviderType::Azure => Arc::new(AzureProvider::from_env(model_config).await?),
+            ProviderType::OpenAi => Arc::new(OpenAiProvider::from_env(model_config).await?),
+            ProviderType::Anthropic => Arc::new(AnthropicProvider::from_env(model_config).await?),
+            ProviderType::Bedrock => Arc::new(BedrockProvider::from_env(model_config).await?),
+            ProviderType::Databricks => Arc::new(DatabricksProvider::from_env(model_config).await?),
+            ProviderType::GcpVertexAI => {
+                Arc::new(GcpVertexAIProvider::from_env(model_config).await?)
+            }
+            ProviderType::Google => Arc::new(GoogleProvider::from_env(model_config).await?),
+            ProviderType::Ollama => Arc::new(OllamaProvider::from_env(model_config).await?),
+            ProviderType::OpenRouter => Arc::new(OpenRouterProvider::from_env(model_config).await?),
+            ProviderType::Xai => Arc::new(XaiProvider::from_env(model_config).await?),
         })
     }
 }
@@ -113,13 +112,13 @@ async fn run_truncate_test(
         .unwrap()
         .with_context_limit(Some(context_window))
         .with_temperature(Some(0.0));
-    let provider = provider_type.create_provider(model_config)?;
+    let provider = provider_type.create_provider(model_config).await?;
 
     let agent = Agent::new();
     agent.update_provider(provider).await?;
     let repeat_count = context_window + 10_000;
     let large_message_content = "hello ".repeat(repeat_count);
-    let messages = Conversation::new(vec![
+    let conversation = Conversation::new(vec![
         Message::user().with_text("hi there. what is 2 + 2?"),
         Message::assistant().with_text("hey! I think it's 4."),
         Message::user().with_text(&large_message_content),
@@ -132,7 +131,7 @@ async fn run_truncate_test(
     ])
     .unwrap();
 
-    let reply_stream = agent.reply(messages, None, None).await?;
+    let reply_stream = agent.reply(conversation, None, None).await?;
     tokio::pin!(reply_stream);
 
     let mut responses = Vec::new();
@@ -145,8 +144,8 @@ async fn run_truncate_test(
             Ok(AgentEvent::ModelChange { .. }) => {
                 // Model change events are informational, just continue
             }
-            Ok(AgentEvent::HistoryReplaced(_)) => {
-                // Handle history replacement events if needed
+            Ok(AgentEvent::HistoryReplaced(_updated_conversation)) => {
+                // Should update the conversation here, but we're not reading it
             }
             Err(e) => {
                 println!("Error: {:?}", e);
@@ -176,14 +175,6 @@ async fn run_truncate_test(
         goose::conversation::message::MessageContent::Text(ref text_content) => {
             assert!(text_content.text.to_lowercase().contains("no"));
             assert!(!text_content.text.to_lowercase().contains("yes"));
-        }
-        goose::conversation::message::MessageContent::ContextLengthExceeded(_) => {
-            // This is an acceptable outcome for providers that don't truncate themselves
-            // and correctly report that the context length was exceeded.
-            println!(
-                "Received ContextLengthExceeded as expected for {:?}",
-                provider_type
-            );
         }
         _ => {
             panic!(
@@ -235,6 +226,16 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_agent_with_anthropic() -> Result<()> {
+        run_test_with_config(TestConfig {
+            provider_type: ProviderType::Anthropic,
+            model: "claude-sonnet-4",
+            context_window: 200_000,
+        })
+        .await
+    }
+
+    #[tokio::test]
     async fn test_agent_with_azure() -> Result<()> {
         run_test_with_config(TestConfig {
             provider_type: ProviderType::Azure,
@@ -245,20 +246,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_agent_with_anthropic() -> Result<()> {
-        run_test_with_config(TestConfig {
-            provider_type: ProviderType::Anthropic,
-            model: "claude-3-5-haiku-latest",
-            context_window: 200_000,
-        })
-        .await
-    }
-
-    #[tokio::test]
     async fn test_agent_with_bedrock() -> Result<()> {
         run_test_with_config(TestConfig {
             provider_type: ProviderType::Bedrock,
-            model: "anthropic.claude-3-5-sonnet-20241022-v2:0",
+            model: "anthropic.claude-sonnet-4-20250514:0",
             context_window: 200_000,
         })
         .await
@@ -278,7 +269,7 @@ mod tests {
     async fn test_agent_with_databricks_bedrock() -> Result<()> {
         run_test_with_config(TestConfig {
             provider_type: ProviderType::Databricks,
-            model: "claude-3-5-sonnet-2",
+            model: "claude-sonnet-4",
             context_window: 200_000,
         })
         .await
@@ -300,16 +291,6 @@ mod tests {
             provider_type: ProviderType::Google,
             model: "gemini-2.0-flash-exp",
             context_window: 1_200_000,
-        })
-        .await
-    }
-
-    #[tokio::test]
-    async fn test_agent_with_groq() -> Result<()> {
-        run_test_with_config(TestConfig {
-            provider_type: ProviderType::Groq,
-            model: "gemma2-9b-it",
-            context_window: 9_000,
         })
         .await
     }
@@ -338,7 +319,7 @@ mod tests {
     async fn test_agent_with_gcpvertexai() -> Result<()> {
         run_test_with_config(TestConfig {
             provider_type: ProviderType::GcpVertexAI,
-            model: "claude-3-5-sonnet-v2@20241022",
+            model: "claude-sonnet-4-20250514",
             context_window: 200_000,
         })
         .await
@@ -363,10 +344,9 @@ mod schedule_tool_tests {
     use goose::agents::platform_tools::PLATFORM_MANAGE_SCHEDULE_TOOL_NAME;
     use goose::scheduler::{ScheduledJob, SchedulerError};
     use goose::scheduler_trait::SchedulerTrait;
-    use goose::session::storage::SessionMetadata;
+    use goose::session::Session;
     use std::sync::Arc;
 
-    // Mock scheduler for testing
     struct MockScheduler {
         jobs: tokio::sync::Mutex<Vec<ScheduledJob>>,
     }
@@ -418,7 +398,7 @@ mod schedule_tool_tests {
             &self,
             _sched_id: &str,
             _limit: usize,
-        ) -> Result<Vec<(String, SessionMetadata)>, SchedulerError> {
+        ) -> Result<Vec<(String, Session)>, SchedulerError> {
             Ok(vec![])
         }
 
@@ -550,12 +530,12 @@ mod schedule_tool_tests {
 mod final_output_tool_tests {
     use super::*;
     use futures::stream;
-    use goose::agents::final_output_tool::{
-        FINAL_OUTPUT_CONTINUATION_MESSAGE, FINAL_OUTPUT_TOOL_NAME,
-    };
+    use goose::agents::final_output_tool::FINAL_OUTPUT_TOOL_NAME;
     use goose::conversation::Conversation;
     use goose::providers::base::MessageStream;
     use goose::recipe::Response;
+    use rmcp::model::CallToolRequestParam;
+    use rmcp::object;
 
     #[tokio::test]
     async fn test_final_output_assistant_message_in_reply() -> Result<()> {
@@ -577,6 +557,10 @@ mod final_output_tool_tests {
                 goose::providers::base::ProviderMetadata::empty()
             }
 
+            fn get_name(&self) -> &str {
+                "mock-test"
+            }
+
             fn get_model_config(&self) -> ModelConfig {
                 self.model_config.clone()
             }
@@ -591,6 +575,16 @@ mod final_output_tool_tests {
                     Message::assistant().with_text("Task completed."),
                     ProviderUsage::new("mock".to_string(), Usage::default()),
                 ))
+            }
+
+            async fn complete_with_model(
+                &self,
+                _model_config: &ModelConfig,
+                system: &str,
+                messages: &[Message],
+                tools: &[Tool],
+            ) -> anyhow::Result<(Message, ProviderUsage), ProviderError> {
+                self.complete(system, messages, tools).await
             }
         }
 
@@ -612,14 +606,15 @@ mod final_output_tool_tests {
         agent.add_final_output_tool(response).await;
 
         // Simulate a final output tool call occurring.
-        let tool_call = mcp_core::tool::ToolCall::new(
-            FINAL_OUTPUT_TOOL_NAME,
-            serde_json::json!({
+        let tool_call = CallToolRequestParam {
+            name: FINAL_OUTPUT_TOOL_NAME.into(),
+            arguments: Some(object!({
                 "result": "Test output"
-            }),
-        );
+            })),
+        };
+
         let (_, result) = agent
-            .dispatch_tool_call(tool_call, "request_id".to_string(), None)
+            .dispatch_tool_call(tool_call, "request_id".to_string(), None, None)
             .await;
 
         assert!(result.is_ok(), "Tool call should succeed");
@@ -661,6 +656,7 @@ mod final_output_tool_tests {
     #[tokio::test]
     async fn test_when_final_output_not_called_in_reply() -> Result<()> {
         use async_trait::async_trait;
+        use goose::agents::final_output_tool::FINAL_OUTPUT_CONTINUATION_MESSAGE;
         use goose::conversation::message::Message;
         use goose::model::ModelConfig;
         use goose::providers::base::{Provider, ProviderUsage};
@@ -670,12 +666,18 @@ mod final_output_tool_tests {
         #[derive(Clone)]
         struct MockProvider {
             model_config: ModelConfig,
+            stream_round: std::sync::Arc<std::sync::Mutex<i32>>,
+            got_continuation_message: std::sync::Arc<std::sync::Mutex<bool>>,
         }
 
         #[async_trait]
         impl Provider for MockProvider {
             fn metadata() -> goose::providers::base::ProviderMetadata {
                 goose::providers::base::ProviderMetadata::empty()
+            }
+
+            fn get_name(&self) -> &str {
+                "mock-test"
             }
 
             fn get_model_config(&self) -> ModelConfig {
@@ -692,14 +694,38 @@ mod final_output_tool_tests {
                 _messages: &[Message],
                 _tools: &[Tool],
             ) -> Result<MessageStream, ProviderError> {
-                let deltas = vec![
-                    Ok((Some(Message::assistant().with_text("Hello")), None)),
-                    Ok((Some(Message::assistant().with_text("Hi!")), None)),
-                    Ok((
-                        Some(Message::assistant().with_text("What is the final output?")),
+                if let Some(last_msg) = _messages.last() {
+                    for content in &last_msg.content {
+                        if let goose::conversation::message::MessageContent::Text(text_content) =
+                            content
+                        {
+                            if text_content.text == FINAL_OUTPUT_CONTINUATION_MESSAGE {
+                                let mut got_continuation =
+                                    self.got_continuation_message.lock().unwrap();
+                                *got_continuation = true;
+                            }
+                        }
+                    }
+                }
+
+                let mut round = self.stream_round.lock().unwrap();
+                *round += 1;
+
+                let deltas = if *round == 1 {
+                    vec![
+                        Ok((Some(Message::assistant().with_text("Hello")), None)),
+                        Ok((Some(Message::assistant().with_text("Hi!")), None)),
+                        Ok((
+                            Some(Message::assistant().with_text("What is the final output?")),
+                            None,
+                        )),
+                    ]
+                } else {
+                    vec![Ok((
+                        Some(Message::assistant().with_text("Additional random delta")),
                         None,
-                    )),
-                ];
+                    ))]
+                };
 
                 let stream = stream::iter(deltas.into_iter());
                 Ok(Box::pin(stream))
@@ -713,12 +739,27 @@ mod final_output_tool_tests {
             ) -> Result<(Message, ProviderUsage), ProviderError> {
                 Err(ProviderError::NotImplemented("Not implemented".to_string()))
             }
+
+            async fn complete_with_model(
+                &self,
+                _model_config: &ModelConfig,
+                system: &str,
+                messages: &[Message],
+                tools: &[Tool],
+            ) -> anyhow::Result<(Message, ProviderUsage), ProviderError> {
+                self.complete(system, messages, tools).await
+            }
         }
 
         let agent = Agent::new();
 
         let model_config = ModelConfig::new("test-model").unwrap();
-        let mock_provider = Arc::new(MockProvider { model_config });
+        let mock_provider = Arc::new(MockProvider {
+            model_config,
+            stream_round: std::sync::Arc::new(std::sync::Mutex::new(0)),
+            got_continuation_message: std::sync::Arc::new(std::sync::Mutex::new(false)),
+        });
+        let mock_provider_clone = mock_provider.clone();
         agent.update_provider(mock_provider).await?;
 
         let response = Response {
@@ -754,7 +795,6 @@ mod final_output_tool_tests {
         }
 
         assert!(!responses.is_empty(), "Should have received responses");
-        println!("Responses: {:?}", responses);
         let last_message = responses.last().unwrap();
 
         // Check that the first 3 messages do not have FINAL_OUTPUT_CONTINUATION_MESSAGE
@@ -774,6 +814,27 @@ mod final_output_tool_tests {
         let message_text = last_message.as_concat_text();
         assert_eq!(message_text, FINAL_OUTPUT_CONTINUATION_MESSAGE);
 
+        // Continue streaming to consume any remaining content, this lets us verify the provider saw the continuation message
+        while let Some(response_result) = reply_stream.next().await {
+            match response_result {
+                Ok(AgentEvent::Message(_response)) => {
+                    break; // Stop after receiving the next message
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    println!("Error while streaming remaining content: {:?}", e);
+                    break;
+                }
+            }
+        }
+
+        // Assert that the provider received the continuation message
+        let got_continuation = mock_provider_clone.got_continuation_message.lock().unwrap();
+        assert!(
+            *got_continuation,
+            "Provider should have received the FINAL_OUTPUT_CONTINUATION_MESSAGE"
+        );
+
         Ok(())
     }
 }
@@ -782,7 +843,7 @@ mod final_output_tool_tests {
 mod retry_tests {
     use super::*;
     use async_trait::async_trait;
-    use goose::agents::types::{RetryConfig, SessionConfig, SuccessCheck};
+    use goose::agents::types::{RetryConfig, SuccessCheck};
     use goose::conversation::message::Message;
     use goose::conversation::Conversation;
     use goose::model::ModelConfig;
@@ -803,6 +864,10 @@ mod retry_tests {
     impl Provider for MockRetryProvider {
         fn metadata() -> goose::providers::base::ProviderMetadata {
             goose::providers::base::ProviderMetadata::empty()
+        }
+
+        fn get_name(&self) -> &str {
+            "mock-test"
         }
 
         fn get_model_config(&self) -> ModelConfig {
@@ -828,6 +893,16 @@ mod retry_tests {
                     ProviderUsage::new("mock".to_string(), Usage::default()),
                 ))
             }
+        }
+
+        async fn complete_with_model(
+            &self,
+            _model_config: &ModelConfig,
+            system: &str,
+            messages: &[Message],
+            tools: &[Tool],
+        ) -> anyhow::Result<(Message, ProviderUsage), ProviderError> {
+            self.complete(system, messages, tools).await
         }
     }
 
@@ -858,21 +933,10 @@ mod retry_tests {
             "Valid config should pass validation"
         );
 
-        let session_config = SessionConfig {
-            id: goose::session::Identifier::Name("test-retry".to_string()),
-            working_dir: std::env::current_dir()?,
-            schedule_id: None,
-            execution_mode: None,
-            max_turns: None,
-            retry_config: Some(retry_config),
-        };
-
         let conversation =
             Conversation::new(vec![Message::user().with_text("Complete this task")]).unwrap();
 
-        let reply_stream = agent
-            .reply(conversation, Some(session_config), None)
-            .await?;
+        let reply_stream = agent.reply(conversation, None, None).await?;
         tokio::pin!(reply_stream);
 
         let mut responses = Vec::new();
@@ -970,10 +1034,8 @@ mod max_turns_tests {
     use goose::model::ModelConfig;
     use goose::providers::base::{Provider, ProviderMetadata, ProviderUsage, Usage};
     use goose::providers::errors::ProviderError;
-    use goose::session::storage::Identifier;
-    use mcp_core::tool::ToolCall;
-    use rmcp::model::Tool;
-    use std::path::PathBuf;
+    use rmcp::model::{CallToolRequestParam, Tool};
+    use rmcp::object;
 
     struct MockToolProvider {}
 
@@ -991,7 +1053,10 @@ mod max_turns_tests {
             _messages: &[Message],
             _tools: &[Tool],
         ) -> Result<(Message, ProviderUsage), ProviderError> {
-            let tool_call = ToolCall::new("test_tool", serde_json::json!({"param": "value"}));
+            let tool_call = CallToolRequestParam {
+                name: "test_tool".into(),
+                arguments: Some(object!({"param": "value"})),
+            };
             let message = Message::assistant().with_tool_request("call_123", Ok(tool_call));
 
             let usage = ProviderUsage::new(
@@ -1000,6 +1065,16 @@ mod max_turns_tests {
             );
 
             Ok((message, usage))
+        }
+
+        async fn complete_with_model(
+            &self,
+            _model_config: &ModelConfig,
+            system_prompt: &str,
+            messages: &[Message],
+            tools: &[Tool],
+        ) -> anyhow::Result<(Message, ProviderUsage), ProviderError> {
+            self.complete(system_prompt, messages, tools).await
         }
 
         fn get_model_config(&self) -> ModelConfig {
@@ -1017,6 +1092,10 @@ mod max_turns_tests {
                 config_keys: vec![],
             }
         }
+
+        fn get_name(&self) -> &str {
+            "mock-test"
+        }
     }
 
     #[tokio::test]
@@ -1025,21 +1104,9 @@ mod max_turns_tests {
         let provider = Arc::new(MockToolProvider::new());
         agent.update_provider(provider).await?;
         // The mock provider will call a non-existent tool, which will fail and allow the loop to continue
-
-        // Create session config with max_turns = 1
-        let session_config = goose::agents::SessionConfig {
-            id: Identifier::Name("test_session".to_string()),
-            working_dir: PathBuf::from("/tmp"),
-            schedule_id: None,
-            execution_mode: None,
-            max_turns: Some(1),
-            retry_config: None,
-        };
         let conversation = Conversation::new(vec![Message::user().with_text("Hello")]).unwrap();
 
-        let reply_stream = agent
-            .reply(conversation, Some(session_config), None)
-            .await?;
+        let reply_stream = agent.reply(conversation, None, None).await?;
         tokio::pin!(reply_stream);
 
         let mut responses = Vec::new();
@@ -1061,7 +1128,9 @@ mod max_turns_tests {
                 }
                 Ok(AgentEvent::McpNotification(_)) => {}
                 Ok(AgentEvent::ModelChange { .. }) => {}
-                Ok(AgentEvent::HistoryReplaced(_)) => {}
+                Ok(AgentEvent::HistoryReplaced(_updated_conversation)) => {
+                    // We should update the conversation here, but we're not reading it
+                }
                 Err(e) => {
                     return Err(e);
                 }
@@ -1069,7 +1138,7 @@ mod max_turns_tests {
         }
 
         assert!(
-            responses.len() >= 1,
+            !responses.is_empty(),
             "Expected at least 1 response, got {}",
             responses.len()
         );
@@ -1085,5 +1154,273 @@ mod max_turns_tests {
             panic!("Expected text content in last message");
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod extension_manager_tests {
+    use super::*;
+    use goose::agents::extension::{ExtensionConfig, PlatformExtensionContext};
+    use goose::agents::extension_manager_extension::{
+        MANAGE_EXTENSIONS_TOOL_NAME, SEARCH_AVAILABLE_EXTENSIONS_TOOL_NAME,
+    };
+    use rmcp::model::CallToolRequestParam;
+    use rmcp::object;
+
+    async fn setup_agent_with_extension_manager() -> Agent {
+        // Add the TODO extension to the config so it can be discovered by search_available_extensions
+        // Set it as disabled initially so tests can enable it
+        let todo_extension_entry = ExtensionEntry {
+            enabled: false,
+            config: ExtensionConfig::Platform {
+                name: "todo".to_string(),
+                description:
+                    "Enable a todo list for Goose so it can keep track of what it is doing"
+                        .to_string(),
+                bundled: Some(true),
+                available_tools: vec![],
+            },
+        };
+        set_extension(todo_extension_entry);
+
+        let agent = Agent::new();
+
+        agent
+            .extension_manager
+            .set_context(PlatformExtensionContext {
+                session_id: Some("test_session".to_string()),
+                extension_manager: Some(Arc::downgrade(&agent.extension_manager)),
+                tool_route_manager: Some(Arc::downgrade(&agent.tool_route_manager)),
+            })
+            .await;
+
+        // Now add the extension manager platform extension
+        let ext_config = ExtensionConfig::Platform {
+            name: "extensionmanager".to_string(),
+            description: "Extension Manager".to_string(),
+            bundled: Some(true),
+            available_tools: vec![],
+        };
+
+        agent
+            .add_extension(ext_config)
+            .await
+            .expect("Failed to add extension manager");
+        agent
+    }
+
+    #[tokio::test]
+    async fn test_extension_manager_tools_available() {
+        let agent = setup_agent_with_extension_manager().await;
+        let tools = agent.list_tools(None).await;
+
+        // Note: Tool names are prefixed with the normalized extension name "extensionmanager"
+        // not the display name "Extension Manager"
+        let search_tool = tools.iter().find(|tool| {
+            tool.name == format!("extensionmanager__{SEARCH_AVAILABLE_EXTENSIONS_TOOL_NAME}")
+        });
+        assert!(
+            search_tool.is_some(),
+            "search_available_extensions tool should be available"
+        );
+
+        let manage_tool = tools
+            .iter()
+            .find(|tool| tool.name == format!("extensionmanager__{MANAGE_EXTENSIONS_TOOL_NAME}"));
+        assert!(
+            manage_tool.is_some(),
+            "manage_extensions tool should be available"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_search_available_extensions_tool_call() {
+        let agent = setup_agent_with_extension_manager().await;
+
+        let tool_call = CallToolRequestParam {
+            name: format!("extensionmanager__{SEARCH_AVAILABLE_EXTENSIONS_TOOL_NAME}").into(),
+            arguments: Some(object!({})),
+        };
+
+        let (_, result) = agent
+            .dispatch_tool_call(tool_call, "request_1".to_string(), None, None)
+            .await;
+
+        assert!(result.is_ok(), "search_available_extensions should succeed");
+        let call_result = result.unwrap().result.await;
+        assert!(
+            call_result.is_ok(),
+            "search_available_extensions execution should succeed"
+        );
+
+        let content = call_result.unwrap();
+        assert!(!content.is_empty(), "Should return some content");
+
+        // Verify the content contains expected text
+        let text = content.first().unwrap().as_text().unwrap();
+        assert!(
+            text.text.contains("Extensions available to enable:"),
+            "Content should contain 'Extensions available to enable:'"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manage_extensions_enable_disable_success() {
+        let agent = setup_agent_with_extension_manager().await;
+
+        let enable_call = CallToolRequestParam {
+            name: format!("extensionmanager__{MANAGE_EXTENSIONS_TOOL_NAME}").into(),
+            arguments: Some(object!({
+                "action": "enable",
+                "extension_name": "todo"
+            })),
+        };
+        let (_, result) = agent
+            .dispatch_tool_call(enable_call, "request_3a".to_string(), None, None)
+            .await;
+        assert!(result.is_ok());
+        let call_result = result.unwrap().result.await;
+        assert!(
+            call_result.is_ok(),
+            "manage_extensions enable execution should succeed"
+        );
+
+        let content = call_result.unwrap();
+        let text = content.first().unwrap().as_text().unwrap();
+        assert!(
+            text.text.contains("todo") && text.text.contains("installed successfully"),
+            "Response should indicate success, got: {}",
+            text.text
+        );
+
+        // Now disable it
+        let disable_call = CallToolRequestParam {
+            name: format!("extensionmanager__{MANAGE_EXTENSIONS_TOOL_NAME}").into(),
+            arguments: Some(object!({
+                "action": "disable",
+                "extension_name": "todo"
+            })),
+        };
+
+        let (_, result) = agent
+            .dispatch_tool_call(disable_call, "request_3b".to_string(), None, None)
+            .await;
+
+        assert!(result.is_ok(), "manage_extensions disable should succeed");
+        let call_result = result.unwrap().result.await;
+        assert!(
+            call_result.is_ok(),
+            "manage_extensions disable execution should succeed"
+        );
+
+        let content = call_result.unwrap();
+        assert!(!content.is_empty(), "Should return confirmation message");
+
+        // Verify the message indicates success
+        let text = content.first().unwrap().as_text().unwrap();
+        assert!(
+            text.text.contains("successfully") || text.text.contains("disabled"),
+            "Response should indicate success, got: {}",
+            text.text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manage_extensions_missing_parameters() {
+        let agent = setup_agent_with_extension_manager().await;
+
+        // Call manage_extensions without action parameter
+        let tool_call = CallToolRequestParam {
+            name: format!("extensionmanager__{MANAGE_EXTENSIONS_TOOL_NAME}").into(),
+            arguments: Some(object!({
+                "extension_name": "todo"
+            })),
+        };
+
+        let (_, result) = agent
+            .dispatch_tool_call(tool_call, "request_4".to_string(), None, None)
+            .await;
+
+        assert!(result.is_ok(), "Tool call should return a result");
+        let call_result = result.unwrap().result.await;
+        assert!(
+            call_result.is_ok(),
+            "Tool execution should return an error result"
+        );
+
+        let content = call_result.unwrap();
+        let text = content.first().unwrap().as_text().unwrap();
+        assert!(
+            text.text.contains("action") || text.text.contains("parameter"),
+            "Error should mention missing action parameter"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manage_extensions_invalid_action() {
+        let agent = setup_agent_with_extension_manager().await;
+
+        let tool_call = CallToolRequestParam {
+            name: format!("extensionmanager__{MANAGE_EXTENSIONS_TOOL_NAME}").into(),
+            arguments: Some(object!({
+                "action": "invalid_action",
+                "extension_name": "todo"
+            })),
+        };
+
+        let (_, result) = agent
+            .dispatch_tool_call(tool_call, "request_6".to_string(), None, None)
+            .await;
+
+        assert!(result.is_ok(), "Tool call should return a result");
+        let call_result = result.unwrap().result.await;
+        assert!(
+            call_result.is_ok(),
+            "Tool execution should return an error result"
+        );
+
+        let content = call_result.unwrap();
+        let text = content.first().unwrap().as_text().unwrap();
+        assert!(
+            text.text.contains("Invalid action")
+                || text.text.contains("enable")
+                || text.text.contains("disable"),
+            "Error should mention invalid action, got: {}",
+            text.text
+        );
+    }
+
+    #[tokio::test]
+    async fn test_manage_extensions_extension_not_found() {
+        let agent = setup_agent_with_extension_manager().await;
+
+        // Try to enable a non-existent extension
+        let tool_call = CallToolRequestParam {
+            name: format!("extensionmanager__{MANAGE_EXTENSIONS_TOOL_NAME}").into(),
+            arguments: Some(object!({
+                "action": "enable",
+                "extension_name": "nonexistent_extension_12345"
+            })),
+        };
+
+        let (_, result) = agent
+            .dispatch_tool_call(tool_call, "request_7".to_string(), None, None)
+            .await;
+
+        assert!(result.is_ok(), "Tool call should return a result");
+        let call_result = result.unwrap().result.await;
+        assert!(
+            call_result.is_ok(),
+            "Tool execution should return an error result"
+        );
+
+        // Check that the error message indicates extension not found
+        let content = call_result.unwrap();
+        let text = content.first().unwrap().as_text().unwrap();
+        assert!(
+            text.text.contains("not found") || text.text.contains("Extension"),
+            "Error should mention extension not found, got: {}",
+            text.text
+        );
     }
 }

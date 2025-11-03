@@ -99,24 +99,13 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
-      - name: Set up Go
-        uses: actions/setup-go@0a12ed9d6a96ab950c8f026ed9f722fe0da7ef32 # pin@v5
-        with:
-          go-version: '1.21'
-
-      - name: Build temporal-service
-        run: |
-          echo "Building temporal-service using build.sh script..."
-          cd temporal-service
-          ./build.sh
-          echo "temporal-service built successfully"
-
       - name: Build goosed binary
         env:
           CROSS_NO_WARNINGS: 0
           RUST_LOG: debug
           RUST_BACKTRACE: 1
           CROSS_VERBOSE: 1
+          CC: gcc-10
         run: |
           source ./bin/activate-hermit
           export TARGET="x86_64-unknown-linux-gnu"
@@ -129,9 +118,7 @@ jobs:
           export TARGET="x86_64-unknown-linux-gnu"
           mkdir -p ui/desktop/src/bin
           cp target/$TARGET/release/goosed ui/desktop/src/bin/
-          cp temporal-service/temporal-service ui/desktop/src/bin/
           chmod +x ui/desktop/src/bin/goosed
-          chmod +x ui/desktop/src/bin/temporal-service
           ls -la ui/desktop/src/bin/
 
       - name: Cache npm dependencies
@@ -157,10 +144,10 @@ jobs:
           source ./bin/activate-hermit
           cd ui/desktop
           echo "Building Linux packages (.deb and .rpm)..."
-          
+
           # Build both .deb and .rpm packages
           npm run make -- --platform=linux --arch=x64
-          
+
           echo "Build completed. Checking output..."
           ls -la out/
           find out/ -name "*.deb" -o -name "*.rpm" | head -10

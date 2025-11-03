@@ -8,6 +8,9 @@ import log from './utils/logger';
 import { App } from 'electron';
 import { Buffer } from 'node:buffer';
 
+import { status } from './api';
+import { Client } from './api/client';
+
 // Find an available port to start goosed on
 export const findAvailablePort = (): Promise<number> => {
   return new Promise((resolve, _reject) => {
@@ -23,35 +26,18 @@ export const findAvailablePort = (): Promise<number> => {
   });
 };
 
-// Goose process manager. Take in the app, port, and directory to start goosed in.
 // Check if goosed server is ready by polling the status endpoint
-const checkServerStatus = async (
-  port: number,
-  maxAttempts?: number,
-  interval: number = 100
-): Promise<boolean> => {
-  if (maxAttempts === undefined) {
-    const isTemporalEnabled = process.env.GOOSE_SCHEDULER_TYPE === 'temporal';
-    maxAttempts = isTemporalEnabled ? 200 : 80;
-    log.info(
-      `Using ${maxAttempts} max attempts (temporal scheduling: ${isTemporalEnabled ? 'enabled' : 'disabled'})`
-    );
-  }
-
-  const statusUrl = `http://127.0.0.1:${port}/status`;
-  log.info(`Checking server status at ${statusUrl}`);
+export const checkServerStatus = async (client: Client): Promise<boolean> => {
+  const interval = 100; // ms
+  const maxAttempts = 1200; // 120s
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
-      const response = await fetch(statusUrl);
-      if (response.ok) {
-        log.info(`Server is ready after ${attempt} attempts`);
-        return true;
-      }
+      await status({ client, throwOnError: true });
+      return true;
     } catch {
-      // Expected error when server isn't ready yet
       if (attempt === maxAttempts) {
-        log.error(`Server failed to respond after ${maxAttempts} attempts`);
+        log.error(`Server failed to respond after ${(interval * maxAttempts) / 1000} seconds`);
       }
     }
     await new Promise((resolve) => setTimeout(resolve, interval));
@@ -64,11 +50,6 @@ const connectToExternalBackend = async (
   port: number = 3000
 ): Promise<[number, string, ChildProcess]> => {
   log.info(`Using external goosed backend on port ${port}`);
-
-  const isReady = await checkServerStatus(port);
-  if (!isReady) {
-    throw new Error(`External goosed server not accessible on port ${port}`);
-  }
 
   const mockProcess = {
     pid: undefined,
@@ -111,15 +92,10 @@ export const startGoosed = async (
     return connectToExternalBackend(dir, 3000);
   }
 
-  // Validate that the directory actually exists and is a directory
   try {
     const stats = fs.lstatSync(dir);
 
-    // Reject symlinks for security - they could point outside intended directories
-    if (stats.isSymbolicLink()) {
-      log.warn(`Provided path is a symlink, falling back to home directory for security`);
-      dir = homeDir;
-    } else if (!stats.isDirectory()) {
+    if (!stats.isDirectory()) {
       log.warn(`Provided path is not a directory, falling back to home directory`);
       dir = homeDir;
     }
@@ -128,48 +104,14 @@ export const startGoosed = async (
     dir = homeDir;
   }
 
-  // Security check: Ensure the directory path doesn't contain suspicious characters
-  if (dir.includes('..') || dir.includes(';') || dir.includes('|') || dir.includes('&')) {
-    throw new Error(`Invalid directory path: ${dir}`);
-  }
-
-  // Get the goosed binary path using the shared utility
   let goosedPath = getBinaryPath(app, 'goosed');
 
-  // Security validation: Ensure the binary path is safe
   const resolvedGoosedPath = path.resolve(goosedPath);
-
-  // Validate that the binary path doesn't contain suspicious characters or sequences
-  if (
-    resolvedGoosedPath.includes('..') ||
-    resolvedGoosedPath.includes(';') ||
-    resolvedGoosedPath.includes('|') ||
-    resolvedGoosedPath.includes('&') ||
-    resolvedGoosedPath.includes('`') ||
-    resolvedGoosedPath.includes('$')
-  ) {
-    throw new Error(`Invalid binary path detected: ${resolvedGoosedPath}`);
-  }
-
-  // Ensure the binary path is within expected application directories
-  const appPath = app.getAppPath();
-  const resourcesPath = process.resourcesPath;
-  const currentWorkingDir = process.cwd();
-
-  const isValidPath =
-    resolvedGoosedPath.startsWith(path.resolve(appPath)) ||
-    resolvedGoosedPath.startsWith(path.resolve(resourcesPath)) ||
-    resolvedGoosedPath.startsWith(path.resolve(currentWorkingDir));
-
-  if (!isValidPath) {
-    throw new Error(`Binary path is outside of allowed directories: ${resolvedGoosedPath}`);
-  }
 
   const port = await findAvailablePort();
 
   log.info(`Starting goosed from: ${resolvedGoosedPath} on port ${port} in dir ${dir}`);
 
-  // Define additional environment variables
   const additionalEnv: GooseProcessEnv = {
     // Set HOME for UNIX-like systems
     HOME: homeDir,
@@ -181,25 +123,13 @@ export const startGoosed = async (
     LOCALAPPDATA: process.env.LOCALAPPDATA || path.join(homeDir, 'AppData', 'Local'),
     // Set PATH to include the binary directory
     PATH: `${path.dirname(resolvedGoosedPath)}${path.delimiter}${process.env.PATH || ''}`,
-    // start with the port specified
     GOOSE_PORT: String(port),
     GOOSE_SERVER__SECRET_KEY: serverSecret,
     // Add any additional environment variables passed in
     ...env,
   } as GooseProcessEnv;
 
-  // Merge parent environment with additional environment variables
   const processEnv: GooseProcessEnv = { ...process.env, ...additionalEnv } as GooseProcessEnv;
-
-  // Add detailed logging for troubleshooting
-  log.info(`Process platform: ${process.platform}`);
-  log.info(`Process cwd: ${process.cwd()}`);
-  log.info(`Target working directory: ${dir}`);
-  log.info(`Environment HOME: ${processEnv.HOME}`);
-  log.info(`Environment USERPROFILE: ${processEnv.USERPROFILE}`);
-  log.info(`Environment APPDATA: ${processEnv.APPDATA}`);
-  log.info(`Environment LOCALAPPDATA: ${processEnv.LOCALAPPDATA}`);
-  log.info(`Environment PATH: ${processEnv.PATH}`);
 
   // Ensure proper executable path on Windows
   if (isWindows && !resolvedGoosedPath.toLowerCase().endsWith('.exe')) {
@@ -239,9 +169,8 @@ export const startGoosed = async (
   log.info('Spawn options:', JSON.stringify(safeSpawnOptions, null, 2));
 
   // Security: Use only hardcoded, safe arguments
-  const safeArgs = ['agent']; // Only allow the 'agent' argument
+  const safeArgs = ['agent'];
 
-  // Spawn the goosed process with validated inputs
   const goosedProcess: ChildProcess = spawn(goosedPath, safeArgs, spawnOptions);
 
   // Only unref on Windows to allow it to run independently of the parent
@@ -266,10 +195,6 @@ export const startGoosed = async (
     throw err; // Propagate the error
   });
 
-  // Wait for the server to be ready
-  const isReady = await checkServerStatus(port);
-  log.info(`Goosed isReady ${isReady}`);
-
   const try_kill_goose = () => {
     try {
       if (isWindows) {
@@ -283,14 +208,7 @@ export const startGoosed = async (
     }
   };
 
-  if (!isReady) {
-    log.error(`Goosed server failed to start on port ${port}`);
-    try_kill_goose();
-    throw new Error(`Goosed server failed to start on port ${port}`);
-  }
-
   // Ensure goosed is terminated when the app quits
-  // TODO will need to do it at tab level next
   app.on('will-quit', () => {
     log.info('App quitting, terminating goosed server');
     try_kill_goose();

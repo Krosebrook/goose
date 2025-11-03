@@ -108,6 +108,8 @@ impl PkceAuthFlow {
 
         let response = client
             .post(TETRATE_TOKEN_URL)
+            .header("X-Title", "goose")
+            .header("Referer", "https://github.com/block/goose")
             .json(&request_body)
             .send()
             .await?;
@@ -161,14 +163,10 @@ impl PkceAuthFlow {
 pub use self::PkceAuthFlow as TetrateAuth;
 
 use crate::config::Config;
-use serde_json::Value;
 
 pub fn configure_tetrate(config: &Config, api_key: String) -> Result<()> {
-    config.set_secret("TETRATE_API_KEY", Value::String(api_key))?;
-    config.set_param("GOOSE_PROVIDER", Value::String("tetrate".to_string()))?;
-    config.set_param(
-        "GOOSE_MODEL",
-        Value::String(TETRATE_DEFAULT_MODEL.to_string()),
-    )?;
+    config.set_secret("TETRATE_API_KEY", &api_key)?;
+    config.set_goose_provider("tetrate")?;
+    config.set_goose_model(TETRATE_DEFAULT_MODEL)?;
     Ok(())
 }

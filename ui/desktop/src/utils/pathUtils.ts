@@ -5,24 +5,6 @@ import Electron from 'electron';
 import log from './logger';
 
 export const getBinaryPath = (app: Electron.App, binaryName: string): string => {
-  // Security validation: Ensure binaryName doesn't contain suspicious characters
-  if (
-    !binaryName ||
-    typeof binaryName !== 'string' ||
-    binaryName.includes('..') ||
-    binaryName.includes('/') ||
-    binaryName.includes('\\') ||
-    binaryName.includes(';') ||
-    binaryName.includes('|') ||
-    binaryName.includes('&') ||
-    binaryName.includes('`') ||
-    binaryName.includes('$') ||
-    binaryName.length > 50
-  ) {
-    // Reasonable length limit
-    throw new Error(`Invalid binary name: ${binaryName}`);
-  }
-
   // On Windows, rely on PATH we just patched in ensureWinShims for command-line tools
   // but use explicit resources/bin path for goosed.exe
   if (process.platform === 'win32') {
@@ -119,7 +101,18 @@ const addPaths = (
  * @returns The expanded path with tilde replaced by home directory
  */
 export function expandTilde(filePath: string): string {
+  if (!filePath || typeof filePath !== 'string') return filePath;
+  // Support "~", "~/..." and "~\\..." on Windows
+  if (filePath === '~') {
+    return os.homedir();
+  }
+  if (filePath.startsWith('~/') || (process.platform === 'win32' && filePath.startsWith('~\\'))) {
+    // Remove the leading "~" and any separator that follows, then join
+    const remainder = filePath.slice(2);
+    return path.join(os.homedir(), remainder);
+  }
   if (filePath.startsWith('~')) {
+    // Generic fallback: replace only the first leading tilde
     return path.join(os.homedir(), filePath.slice(1));
   }
   return filePath;

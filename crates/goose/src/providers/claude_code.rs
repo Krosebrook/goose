@@ -9,15 +9,14 @@ use tokio::process::Command;
 
 use super::base::{ConfigKey, Provider, ProviderMetadata, ProviderUsage, Usage};
 use super::errors::ProviderError;
-use super::utils::emit_debug_trace;
-use crate::config::Config;
+use super::utils::RequestLog;
+use crate::config::{Config, GooseMode};
 use crate::conversation::message::{Message, MessageContent};
-use crate::impl_provider_default;
 use crate::model::ModelConfig;
 use rmcp::model::Tool;
 
-pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-3-5-sonnet-latest";
-pub const CLAUDE_CODE_KNOWN_MODELS: &[&str] = &["sonnet", "opus", "claude-3-5-sonnet-latest"];
+pub const CLAUDE_CODE_DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+pub const CLAUDE_CODE_KNOWN_MODELS: &[&str] = &["sonnet", "opus", "claude-sonnet-4-20250514"];
 
 pub const CLAUDE_CODE_DOC_URL: &str = "https://claude.ai/cli";
 
@@ -25,12 +24,12 @@ pub const CLAUDE_CODE_DOC_URL: &str = "https://claude.ai/cli";
 pub struct ClaudeCodeProvider {
     command: String,
     model: ModelConfig,
+    #[serde(skip)]
+    name: String,
 }
 
-impl_provider_default!(ClaudeCodeProvider);
-
 impl ClaudeCodeProvider {
-    pub fn from_env(model: ModelConfig) -> Result<Self> {
+    pub async fn from_env(model: ModelConfig) -> Result<Self> {
         let config = crate::config::Config::global();
         let command: String = config
             .get_param("CLAUDE_CODE_COMMAND")
@@ -45,6 +44,7 @@ impl ClaudeCodeProvider {
         Ok(Self {
             command: resolved_command,
             model,
+            name: Self::metadata().name,
         })
     }
 
@@ -129,7 +129,7 @@ impl ClaudeCodeProvider {
     fn messages_to_claude_format(&self, _system: &str, messages: &[Message]) -> Result<Value> {
         let mut claude_messages = Vec::new();
 
-        for message in messages {
+        for message in messages.iter().filter(|m| m.is_agent_visible()) {
             let role = match message.role {
                 Role::User => "user",
                 Role::Assistant => "assistant",
@@ -282,12 +282,11 @@ impl ClaudeCodeProvider {
 
         let message_content = vec![MessageContent::text(combined_text)];
 
-        let response_message = Message {
-            id: None,
-            role: Role::Assistant,
-            created: chrono::Utc::now().timestamp(),
-            content: message_content,
-        };
+        let response_message = Message::new(
+            Role::Assistant,
+            chrono::Utc::now().timestamp(),
+            message_content,
+        );
 
         Ok((response_message, usage))
     }
@@ -339,10 +338,8 @@ impl ClaudeCodeProvider {
 
         // Add permission mode based on GOOSE_MODE setting
         let config = Config::global();
-        if let Ok(goose_mode) = config.get_param::<String>("GOOSE_MODE") {
-            if goose_mode.as_str() == "auto" {
-                cmd.arg("--permission-mode").arg("acceptEdits");
-            }
+        if let Ok(GooseMode::Auto) = config.get_goose_mode() {
+            cmd.arg("--permission-mode").arg("acceptEdits");
         }
 
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
@@ -433,12 +430,11 @@ impl ClaudeCodeProvider {
             println!("================================");
         }
 
-        let message = Message {
-            id: None,
-            role: Role::Assistant,
-            created: chrono::Utc::now().timestamp(),
-            content: vec![MessageContent::text(description.clone())],
-        };
+        let message = Message::new(
+            Role::Assistant,
+            chrono::Utc::now().timestamp(),
+            vec![MessageContent::text(description.clone())],
+        );
 
         let usage = Usage::default();
 
@@ -468,17 +464,22 @@ impl Provider for ClaudeCodeProvider {
         )
     }
 
+    fn get_name(&self) -> &str {
+        &self.name
+    }
+
     fn get_model_config(&self) -> ModelConfig {
         // Return the model config with appropriate context limit for Claude models
         self.model.clone()
     }
 
     #[tracing::instrument(
-        skip(self, system, messages, tools),
+        skip(self, model_config, system, messages, tools),
         fields(model_config, input, output, input_tokens, output_tokens, total_tokens)
     )]
-    async fn complete(
+    async fn complete_with_model(
         &self,
+        model_config: &ModelConfig,
         system: &str,
         messages: &[Message],
         tools: &[Tool],
@@ -495,21 +496,22 @@ impl Provider for ClaudeCodeProvider {
         // Create a dummy payload for debug tracing
         let payload = json!({
             "command": self.command,
-            "model": self.model.model_name,
+            "model": model_config.model_name,
             "system": system,
             "messages": messages.len()
         });
+        let mut log = RequestLog::start(model_config, &payload)?;
 
         let response = json!({
             "lines": json_lines.len(),
             "usage": usage
         });
 
-        emit_debug_trace(&self.model, &payload, &response, &usage);
+        log.write(&response, Some(&usage))?;
 
         Ok((
             message,
-            ProviderUsage::new(self.model.model_name.clone(), usage),
+            ProviderUsage::new(model_config.model_name.clone(), usage),
         ))
     }
 }
@@ -519,43 +521,21 @@ mod tests {
     use super::ModelConfig;
     use super::*;
 
-    #[test]
-    fn test_claude_code_model_config() {
-        let provider = ClaudeCodeProvider::default();
-        let config = provider.get_model_config();
-
-        assert_eq!(config.model_name, "claude-3-5-sonnet-latest");
-        // Context limit should be set by the ModelConfig
-        assert!(config.context_limit() > 0);
-    }
-
-    #[test]
-    fn test_permission_mode_flag_construction() {
-        // Test that in auto mode, the --permission-mode acceptEdits flag is added
-        std::env::set_var("GOOSE_MODE", "auto");
-
-        let config = Config::global();
-        let goose_mode: String = config.get_param("GOOSE_MODE").unwrap();
-        assert_eq!(goose_mode, "auto");
-
-        std::env::remove_var("GOOSE_MODE");
-    }
-
-    #[test]
-    fn test_claude_code_invalid_model_no_fallback() {
+    #[tokio::test]
+    async fn test_claude_code_invalid_model_no_fallback() {
         // Test that an invalid model is kept as-is (no fallback)
         let invalid_model = ModelConfig::new_or_fail("invalid-model");
-        let provider = ClaudeCodeProvider::from_env(invalid_model).unwrap();
+        let provider = ClaudeCodeProvider::from_env(invalid_model).await.unwrap();
         let config = provider.get_model_config();
 
         assert_eq!(config.model_name, "invalid-model");
     }
 
-    #[test]
-    fn test_claude_code_valid_model() {
+    #[tokio::test]
+    async fn test_claude_code_valid_model() {
         // Test that a valid model is preserved
         let valid_model = ModelConfig::new_or_fail("sonnet");
-        let provider = ClaudeCodeProvider::from_env(valid_model).unwrap();
+        let provider = ClaudeCodeProvider::from_env(valid_model).await.unwrap();
         let config = provider.get_model_config();
 
         assert_eq!(config.model_name, "sonnet");

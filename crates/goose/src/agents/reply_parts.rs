@@ -1,9 +1,9 @@
 use anyhow::Result;
-use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_stream::try_stream;
 use futures::stream::StreamExt;
+use tracing::debug;
 
 use super::super::agents::Agent;
 use crate::conversation::message::{Message, MessageContent, ToolRequest};
@@ -15,7 +15,8 @@ use crate::providers::toolshim::{
     modify_system_prompt_for_tool_json, OllamaInterpreter,
 };
 
-use crate::session;
+use crate::agents::recipe_tools::dynamic_task_tools::should_enabled_subagents;
+use crate::session::SessionManager;
 use rmcp::model::Tool;
 
 async fn toolshim_postprocess(
@@ -32,8 +33,7 @@ async fn toolshim_postprocess(
 }
 
 impl Agent {
-    /// Prepares tools and system prompt for a provider request
-    pub async fn prepare_tools_and_prompt(&self) -> anyhow::Result<(Vec<Tool>, Vec<Tool>, String)> {
+    pub async fn prepare_tools_and_prompt(&self) -> Result<(Vec<Tool>, Vec<Tool>, String)> {
         // Get router enabled status
         let router_enabled = self.tool_route_manager.is_router_enabled().await;
 
@@ -43,6 +43,15 @@ impl Agent {
         // If router is disabled and no tools were returned, fall back to regular tools
         if !router_enabled && tools.is_empty() {
             tools = self.list_tools(None).await;
+            let provider = self.provider().await?;
+            let model_name = provider.get_model_config().model_name;
+
+            if !should_enabled_subagents(&model_name) {
+                tools.retain(|tool| {
+                    tool.name != crate::agents::subagent_execution_tool::subagent_execute_task_tool::SUBAGENT_EXECUTE_TASK_TOOL_NAME
+                        && tool.name != crate::agents::recipe_tools::dynamic_task_tools::DYNAMIC_TASK_TOOL_NAME_PREFIX
+                });
+            }
         }
 
         // Add frontend tools
@@ -51,9 +60,15 @@ impl Agent {
             tools.push(frontend_tool.tool.clone());
         }
 
+        if !router_enabled {
+            // Stable tool ordering is important for multi session prompt caching.
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+        }
+
         // Prepare system prompt
-        let extension_manager = self.extension_manager.read().await;
-        let extensions_info = extension_manager.get_extensions_info().await;
+        let extensions_info = self.extension_manager.get_extensions_info().await;
+        let (extension_count, tool_count) =
+            self.extension_manager.get_extension_and_tool_counts().await;
 
         // Get model name from provider
         let provider = self.provider().await?;
@@ -61,13 +76,13 @@ impl Agent {
         let model_name = &model_config.model_name;
 
         let prompt_manager = self.prompt_manager.lock().await;
-        let mut system_prompt = prompt_manager.build_system_prompt(
-            extensions_info,
-            self.frontend_instructions.lock().await.clone(),
-            extension_manager.suggest_disable_extensions_prompt().await,
-            Some(model_name),
-            router_enabled,
-        );
+        let mut system_prompt = prompt_manager
+            .builder(model_name)
+            .with_extensions(extensions_info.into_iter())
+            .with_frontend_instructions(self.frontend_instructions.lock().await.clone())
+            .with_extension_and_tool_counts(extension_count, tool_count)
+            .with_router_enabled(router_enabled)
+            .build();
 
         // Handle toolshim if enabled
         let mut toolshim_tools = vec![];
@@ -81,70 +96,6 @@ impl Agent {
         }
 
         Ok((tools, toolshim_tools, system_prompt))
-    }
-
-    /// Categorize tools based on their annotations
-    /// Returns:
-    /// - read_only_tools: Tools with read-only annotations
-    /// - non_read_tools: Tools without read-only annotations
-    pub(crate) fn categorize_tools_by_annotation(
-        tools: &[Tool],
-    ) -> (HashSet<String>, HashSet<String>) {
-        tools
-            .iter()
-            .fold((HashSet::new(), HashSet::new()), |mut acc, tool| {
-                match &tool.annotations {
-                    Some(annotations) if annotations.read_only_hint.unwrap_or(false) => {
-                        acc.0.insert(tool.name.to_string());
-                    }
-                    _ => {
-                        acc.1.insert(tool.name.to_string());
-                    }
-                }
-                acc
-            })
-    }
-
-    /// Generate a response from the LLM provider
-    /// Handles toolshim transformations if needed
-    pub(crate) async fn generate_response_from_provider(
-        provider: Arc<dyn Provider>,
-        system_prompt: &str,
-        messages: &[Message],
-        tools: &[Tool],
-        toolshim_tools: &[Tool],
-    ) -> Result<(Message, ProviderUsage), ProviderError> {
-        let config = provider.get_model_config();
-
-        // Convert tool messages to text if toolshim is enabled
-        let messages_for_provider = if config.toolshim {
-            convert_tool_messages_to_text(messages)
-        } else {
-            Conversation::new_unvalidated(messages.to_vec())
-        };
-
-        // Call the provider to get a response
-        let (mut response, mut usage) = provider
-            .complete(system_prompt, messages_for_provider.messages(), tools)
-            .await?;
-
-        // Ensure we have token counts, estimating if necessary
-        usage
-            .ensure_tokens(
-                system_prompt,
-                messages_for_provider.messages(),
-                &response,
-                tools,
-            )
-            .await?;
-
-        crate::providers::base::set_current_model(&usage.model);
-
-        if config.toolshim {
-            response = toolshim_postprocess(response, toolshim_tools).await?;
-        }
-
-        Ok((response, usage))
     }
 
     /// Stream a response from the LLM provider.
@@ -171,34 +122,46 @@ impl Agent {
         let toolshim_tools = toolshim_tools.to_owned();
         let provider = provider.clone();
 
-        let mut stream = if provider.supports_streaming() {
-            provider
+        // Capture errors during stream creation and return them as part of the stream
+        // so they can be handled by the existing error handling logic in the agent
+        let stream_result = if provider.supports_streaming() {
+            debug!("WAITING_LLM_STREAM_START");
+            let result = provider
                 .stream(
                     system_prompt.as_str(),
                     messages_for_provider.messages(),
                     &tools,
                 )
-                .await?
+                .await;
+            debug!("WAITING_LLM_STREAM_END");
+            result
         } else {
-            let (message, mut usage) = provider
+            debug!("WAITING_LLM_START");
+            let complete_result = provider
                 .complete(
                     system_prompt.as_str(),
                     messages_for_provider.messages(),
                     &tools,
                 )
-                .await?;
+                .await;
+            debug!("WAITING_LLM_END");
 
-            // Ensure we have token counts for non-streaming case
-            usage
-                .ensure_tokens(
-                    system_prompt.as_str(),
-                    messages_for_provider.messages(),
-                    &message,
-                    &tools,
-                )
-                .await?;
+            match complete_result {
+                Ok((message, usage)) => Ok(stream_from_single_message(message, usage)),
+                Err(e) => Err(e),
+            }
+        };
 
-            stream_from_single_message(message, usage)
+        // If there was an error creating the stream, return a stream that yields that error
+        let mut stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                // Return a stream that immediately yields the error
+                // This allows the error to be caught by existing error handling in agent.rs
+                return Ok(Box::pin(try_stream! {
+                    yield Err(e)?;
+                }));
+            }
         };
 
         Ok(Box::pin(try_stream! {
@@ -261,12 +224,13 @@ impl Agent {
             }
         }
 
-        let filtered_message = Message {
-            id: response.id.clone(),
-            role: response.role.clone(),
-            created: response.created,
-            content: filtered_content,
-        };
+        let mut filtered_message =
+            Message::new(response.role.clone(), response.created, filtered_content);
+
+        // Preserve the ID if it exists
+        if let Some(id) = response.id.clone() {
+            filtered_message = filtered_message.with_id(id);
+        }
 
         // Categorize tool requests
         let mut frontend_requests = Vec::new();
@@ -291,23 +255,9 @@ impl Agent {
     pub(crate) async fn update_session_metrics(
         session_config: &crate::agents::types::SessionConfig,
         usage: &ProviderUsage,
-        messages_length: usize,
     ) -> Result<()> {
-        let session_file_path = match session::storage::get_path(session_config.id.clone()) {
-            Ok(path) => path,
-            Err(e) => {
-                return Err(anyhow::anyhow!("Failed to get session file path: {}", e));
-            }
-        };
-        let mut metadata = session::storage::read_metadata(&session_file_path)?;
-
-        metadata.schedule_id = session_config.schedule_id.clone();
-
-        metadata.total_tokens = usage.usage.total_tokens;
-        metadata.input_tokens = usage.usage.input_tokens;
-        metadata.output_tokens = usage.usage.output_tokens;
-
-        metadata.message_count = messages_length + 1;
+        let session_id = session_config.id.as_str();
+        let session = SessionManager::get_session(session_id, false).await?;
 
         let accumulate = |a: Option<i32>, b: Option<i32>| -> Option<i32> {
             match (a, b) {
@@ -315,16 +265,122 @@ impl Agent {
                 _ => a.or(b),
             }
         };
-        metadata.accumulated_total_tokens =
-            accumulate(metadata.accumulated_total_tokens, usage.usage.total_tokens);
-        metadata.accumulated_input_tokens =
-            accumulate(metadata.accumulated_input_tokens, usage.usage.input_tokens);
-        metadata.accumulated_output_tokens = accumulate(
-            metadata.accumulated_output_tokens,
-            usage.usage.output_tokens,
-        );
 
-        session::storage::update_metadata(&session_file_path, &metadata).await?;
+        let accumulated_total =
+            accumulate(session.accumulated_total_tokens, usage.usage.total_tokens);
+        let accumulated_input =
+            accumulate(session.accumulated_input_tokens, usage.usage.input_tokens);
+        let accumulated_output =
+            accumulate(session.accumulated_output_tokens, usage.usage.output_tokens);
+
+        SessionManager::update_session(session_id)
+            .schedule_id(session_config.schedule_id.clone())
+            .total_tokens(usage.usage.total_tokens)
+            .input_tokens(usage.usage.input_tokens)
+            .output_tokens(usage.usage.output_tokens)
+            .accumulated_total_tokens(accumulated_total)
+            .accumulated_input_tokens(accumulated_input)
+            .accumulated_output_tokens(accumulated_output)
+            .apply()
+            .await?;
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::conversation::message::Message;
+    use crate::model::ModelConfig;
+    use crate::providers::base::{Provider, ProviderUsage, Usage};
+    use crate::providers::errors::ProviderError;
+    use async_trait::async_trait;
+    use rmcp::object;
+
+    #[derive(Clone)]
+    struct MockProvider {
+        model_config: ModelConfig,
+    }
+
+    #[async_trait]
+    impl Provider for MockProvider {
+        fn metadata() -> crate::providers::base::ProviderMetadata {
+            crate::providers::base::ProviderMetadata::empty()
+        }
+
+        fn get_name(&self) -> &str {
+            "mock"
+        }
+
+        fn get_model_config(&self) -> ModelConfig {
+            self.model_config.clone()
+        }
+
+        async fn complete_with_model(
+            &self,
+            _model_config: &ModelConfig,
+            _system: &str,
+            _messages: &[Message],
+            _tools: &[Tool],
+        ) -> anyhow::Result<(Message, ProviderUsage), ProviderError> {
+            Ok((
+                Message::assistant().with_text("ok"),
+                ProviderUsage::new("mock".to_string(), Usage::default()),
+            ))
+        }
+    }
+
+    #[tokio::test]
+    async fn prepare_tools_sorts_when_router_disabled_and_includes_frontend_and_list_tools(
+    ) -> anyhow::Result<()> {
+        let agent = crate::agents::Agent::new();
+
+        let model_config = ModelConfig::new("test-model").unwrap();
+        let provider = std::sync::Arc::new(MockProvider { model_config });
+        agent.update_provider(provider).await?;
+
+        // Disable the router to trigger sorting
+        agent.disable_router_for_recipe().await;
+
+        // Add unsorted frontend tools
+        let frontend_tools = vec![
+            Tool::new(
+                "frontend__z_tool".to_string(),
+                "Z tool".to_string(),
+                object!({ "type": "object", "properties": { } }),
+            ),
+            Tool::new(
+                "frontend__a_tool".to_string(),
+                "A tool".to_string(),
+                object!({ "type": "object", "properties": { } }),
+            ),
+        ];
+
+        agent
+            .add_extension(crate::agents::extension::ExtensionConfig::Frontend {
+                name: "frontend".to_string(),
+                description: "desc".to_string(),
+                tools: frontend_tools,
+                instructions: None,
+                bundled: None,
+                available_tools: vec![],
+            })
+            .await
+            .unwrap();
+
+        let (tools, _toolshim_tools, _system_prompt) = agent.prepare_tools_and_prompt().await?;
+
+        // Ensure both platform and frontend tools are present
+        let names: Vec<String> = tools.iter().map(|t| t.name.clone().into_owned()).collect();
+        assert!(names.iter().any(|n| n.starts_with("platform__")));
+        assert!(names.iter().any(|n| n == "frontend__a_tool"));
+        assert!(names.iter().any(|n| n == "frontend__z_tool"));
+
+        // Verify the names are sorted ascending
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
 
         Ok(())
     }

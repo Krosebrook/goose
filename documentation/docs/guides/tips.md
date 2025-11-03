@@ -1,6 +1,6 @@
 ---
 title: Quick Goose Tips
-sidebar_position: 6
+sidebar_position: 30
 sidebar_label: Quick Tips
 description: Best practices for working with Goose
 ---
@@ -21,7 +21,7 @@ You can customize how much [supervision](/docs/guides/goose-permissions) Goose n
 Your experience with Goose is shaped by your [choice of LLM](/blog/2025/03/31/goose-benchmark), as it handles all the planning while Goose manages the execution. When choosing an LLM, consider its tool support, specific capabilities, and associated costs.
 
 ### Keep sessions short
-LLMs have context windows, which are limits on how much conversation history they can retain. Once exceeded, they may forget earlier parts of the conversation. Monitor your token usage and [start new sessions](/docs/guides/managing-goose-sessions) as needed.
+LLMs have context windows, which are limits on how much conversation history they can retain. Once exceeded, they may forget earlier parts of the conversation. Monitor your token usage and [start new sessions](/docs/guides/sessions/session-management) as needed.
 
 ### Turn off unnecessary extensions or tool
 Turning on too many extensions can degrade performance. Enable only essential [extensions and tools](/docs/guides/managing-tools/tool-permissions) to improve tool selection accuracy, save context window space, and stay within provider tool limits.
@@ -46,3 +46,12 @@ You don’t need to get it right the first time. Iterating on prompts and tools 
 
 ### Keep Goose updated
 Regularly [update](/docs/guides/updating-goose) Goose to benefit from the latest features, bug fixes, and performance improvements.
+
+### Pair Two Models to Save Money 
+Use [lead/worker model](/docs/tutorials/lead-worker/) to have goose use a "lead" model for early planning before handing the task to a lower-cost "worker" model for execution.  
+
+### Make Recipes Safe to Re-run
+Write [recipes](/docs/guides/recipes/session-recipes) that check your current state before acting, so they can be run multiple times without causing any errors or duplication. 
+
+### Add Logging to Recipes
+Include informative log messages in your recipes for each major step to make debugging and troubleshooting easier should something fail.
